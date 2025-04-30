@@ -1,83 +1,157 @@
 import socket
-import threading
+from _thread import *
 from datetime import datetime
+import json
+import sys
 
-class ChatServer:
-    def __init__(self, host, port):
-        self.host = host
-        self.port = port
-        self.clients = {}  # {socket: (ip, port, name)}
-        self.server_socket = None
-        self.running = False
+chat_history = []
+connected_users = {}
 
-    def start(self):
-        self.running = True
+
+def is_port_in_use(ip, port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(5)
-            print(f"Сервер запущен на {self.host}:{self.port}")
-            
-            while self.running:
-                client_socket, (client_ip, client_port) = self.server_socket.accept()
-                threading.Thread(
-                    target=self.handle_client,
-                    args=(client_socket, client_ip, client_port),
-                    daemon=True
-                ).start()
-                
-        except Exception as e:
-            print(f"Ошибка сервера: {e}")
-        finally:
-            if self.server_socket:
-                self.server_socket.close()
+            s.bind((ip, port))
+            return False
+        except OSError:
+            return True
 
-    def handle_client(self, sock, ip, port):
+
+def save_history():
+    try:
+        with open('chat_history.json', 'w', encoding='utf-8') as f:
+            json.dump(chat_history, f, ensure_ascii=False)
+    except Exception as e:
+        print({e})
+
+
+def load_history():
+    try:
+        with open('chat_history.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    except Exception as e:
+        print({e})
+        return []
+
+
+def broadcast(message, exclude_socket=None):
+    for client in list(connected_users.keys()):
+        if client != exclude_socket:
+            try:
+                client.send(message.encode('utf-8'))
+            except:
+                continue
+
+
+def tcp(client_sock, client_ip, username):
+    global chat_history
+
+    welcome_msg = f"Добро пожаловать, {username}"
+    try:
+        client_sock.send(welcome_msg.encode('utf-8'))
+    except:
+        return
+    while True:
         try:
-            # Получаем имя клиента
-            name = sock.recv(1024).decode('utf-8').strip()
-            with threading.Lock():
-                self.clients[sock] = (ip, port, name)
-            
-            print(f"[{datetime.now().strftime('%H:%M')}] {name} ({ip}:{port}) подключился")
-            
-            # Основной цикл обработки сообщений
-            while self.running:
-                data = sock.recv(1024)
-                if not data:
-                    break
-                    
-                message = data.decode('utf-8')
-                print(f"[{datetime.now().strftime('%H:%M')}] {name}: {message}")
-                
-                # Рассылка сообщения всем клиентам
-                self.broadcast(f"{name}: {message}", exclude_sock=sock)
-                
-        except Exception as e:
-            print(f"Ошибка клиента {ip}:{port}: {e}")
-        finally:
-            self.cleanup_client(sock)
+            message = client_sock.recv(1024).decode("utf-8").strip()
+            if not message:
+                break
 
-    def broadcast(self, message, exclude_sock=None):
-        with threading.Lock():
-            for sock in list(self.clients.keys()):
-                if sock != exclude_sock:
-                    try:
-                        sock.sendall(message.encode('utf-8'))
-                    except:
-                        self.cleanup_client(sock)
+            if message == "/users":
+                user_list = "\n".join([f"- {user}" for ip, user in connected_users.values()])
+                response = f"=== Список пользователей ===\n{user_list}\n==="
+                client_sock.send(response.encode('utf-8'))
+                continue
 
-    def cleanup_client(self, sock):
-        if sock in self.clients:
-            ip, port, name = self.clients[sock]
-            print(f"[{datetime.now().strftime('%H:%M')}] {name} ({ip}:{port}) отключился")
-            with threading.Lock():
-                del self.clients[sock]
-            sock.close()
+            if message == "/hist":
+                history = "\n".join(chat_history[-20:])
+                response = f"=== История чата ===\n{history}\n==="
+                client_sock.send(response.encode('utf-8'))
+                continue
+
+            timestamp = datetime.now().strftime("%H:%M")
+            simple_msg = f"{username}: {message}"
+            full_msg = f"[{timestamp}] {simple_msg}"
+
+            print(full_msg)
+            chat_history.append(full_msg)
+            save_history()
+
+            broadcast(simple_msg, exclude_socket=client_sock)
+
+        except (ConnectionResetError, ConnectionAbortedError):
+            break
+
+    leave_message = f"{username} покинул чат"
+    print(f"[{datetime.now().strftime('%H:%M')}] {leave_message}")
+    chat_history.append(f"[{datetime.now().strftime('%H:%M')}] {leave_message}")
+    save_history()
+
+    try:
+        if client_sock in connected_users:
+            del connected_users[client_sock]
+        broadcast(leave_message)
+    except Exception as e:
+        print(f"Ошибка при отправке сообщения: {e}")
+    finally:
+        try:
+            client_sock.close()
+        except:
+            pass
+
+
+def start_server(server_ip, server_tcp_port):
+    global chat_history
+    chat_history = load_history()
+    if is_port_in_use(server_ip, server_tcp_port):
+        print(f"Порт {server_tcp_port} на IP {server_ip} уже занят")
+        sys.exit(1)
+
+    try:
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((server_ip, server_tcp_port))
+        server_socket.listen(5)
+    except OSError as e:
+        print({e})
+        sys.exit(1)
+
+    print(f"Сервер запущен на {server_ip}:{server_tcp_port}")
+
+    try:
+        while True:
+            try:
+                client_socket, (client_ip, _) = server_socket.accept()
+                username = client_socket.recv(1024).decode("utf-8").strip()
+
+                connected_users[client_socket] = (client_ip, username)
+                start_message = f"[{datetime.now().strftime('%H:%M')}] {username} присоединился к чату"
+                print(start_message)
+                chat_history.append(start_message)
+                save_history()
+
+                broadcast(start_message, exclude_socket=client_socket)
+                start_new_thread(tcp, (client_socket, client_ip, username))
+
+            except Exception as e:
+                print({e})
+                continue
+
+    except KeyboardInterrupt:
+        print("\nСервер завершает работу")
+    finally:
+        server_socket.close()
+        print("Сервер остановлен")
+
 
 if __name__ == "__main__":
-    server_ip = input("Введите IP сервера (например 127.0.0.1): ")
-    server_port = int(input("Введите порт сервера (например 5555): "))
-    server = ChatServer(server_ip, server_port)
-    server.start()
+    try:
+        server_ip = input("Введите IP сервера: ")
+        server_tcp_port = int(input("Введите TCP порт сервера: "))
+        start_server(server_ip, server_tcp_port)
+    except ValueError:
+        print("Ошибка: порт должен быть числом")
+    except Exception as e:
+        print(f"Неожиданная ошибка: {e}")
